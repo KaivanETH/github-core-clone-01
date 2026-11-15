@@ -12,6 +12,7 @@ import { handleRest, type Ctx, type Reply } from './rest.ts';
 import { infoRefs, ProtocolError, receivePack, uploadPack, type GitReply } from './gitproto.ts';
 import { gunzipSync } from 'node:zlib';
 import { handleGraphQL } from './graphql.ts';
+import { handleMcp } from './mcp.ts';
 
 const JSON_TYPE = 'application/json; charset=utf-8';
 const API_PREFIX = '/api/v3';
@@ -202,6 +203,30 @@ async function handleGit(forge: Forge, req: IncomingMessage, res: ServerResponse
   sendGit(res, action === 'git-upload-pack' ? uploadPack(forge, repo, body, gitProtocol) : receivePack(forge, repo, body));
 }
 
+/** POST /mcp: JSON-RPC over Streamable HTTP; 401 without the token, 400 -32700 for a body that is not JSON. */
+async function handleMcpRequest(forge: Forge, req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const denied = authFailure(req);
+  if (denied !== null) {
+    req.resume();
+    sendJson(res, 401, { jsonrpc: '2.0', id: null, error: { code: -32001, message: denied.message }, message: denied.message }, { 'www-authenticate': 'Bearer realm="forge"' });
+    return;
+  }
+  const method = (req.method ?? 'GET').toUpperCase();
+  if (method === 'DELETE') {
+    req.resume();
+    sendJson(res, 200, {});
+    return;
+  }
+  if (method !== 'POST') {
+    req.resume();
+    sendJson(res, 405, { jsonrpc: '2.0', id: null, error: { code: -32000, message: 'Method Not Allowed: this server streams no server-initiated messages' }, message: 'Method Not Allowed' }, { allow: 'POST, DELETE' });
+    return;
+  }
+  const text = (await readBody(req)).toString('utf8');
+  const reply = handleMcp(forge, originOf(req), text);
+  sendJson(res, reply.status, reply.body, reply.headers ?? {});
+}
+
 /** POST /api/graphql: {query, variables, operationName} or an array of them; 401 without the token. */
 async function handleGraphQLRequest(forge: Forge, req: IncomingMessage, res: ServerResponse): Promise<void> {
   const scopes = { 'x-oauth-scopes': OAUTH_SCOPES };
@@ -254,6 +279,14 @@ export function createApp(): Server {
           process.stderr.write(`[entry] ${req.method} ${req.url}: ${err instanceof Error ? (err.stack ?? err.message) : String(err)}\n`);
           sendJson(res, 500, { message: 'Internal Server Error' });
         }
+      });
+      return;
+    }
+
+    if (path === '/mcp' || path === '/mcp/') {
+      handleMcpRequest(forge, req, res).catch((err: unknown) => {
+        process.stderr.write(`[entry] ${req.method} ${req.url}: ${err instanceof Error ? (err.stack ?? err.message) : String(err)}\n`);
+        sendJson(res, 200, { jsonrpc: '2.0', id: null, error: { code: -32603, message: 'Internal error' } });
       });
       return;
     }
