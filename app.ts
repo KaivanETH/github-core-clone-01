@@ -9,6 +9,8 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { ApiError, Forge } from './forge.ts';
 import { handleRest, type Ctx, type Reply } from './rest.ts';
+import { infoRefs, ProtocolError, receivePack, uploadPack, type GitReply } from './gitproto.ts';
+import { gunzipSync } from 'node:zlib';
 
 const JSON_TYPE = 'application/json; charset=utf-8';
 const API_PREFIX = '/api/v3';
@@ -49,7 +51,13 @@ function credentialOf(req: IncomingMessage): string | null {
   const header = req.headers.authorization;
   if (typeof header !== 'string') return null;
   const match = /^(?:bearer|token)\s+(\S+)\s*$/i.exec(header.trim());
-  return match === null ? null : (match[1] as string);
+  if (match !== null) return match[1] as string;
+  const basic = /^basic\s+(\S+)\s*$/i.exec(header.trim());
+  if (basic === null) return null;
+  const decoded = Buffer.from(basic[1] as string, 'base64').toString('utf8');
+  const colon = decoded.indexOf(':');
+  const password = colon >= 0 ? decoded.slice(colon + 1) : decoded;
+  return password !== '' ? password : colon > 0 ? decoded.slice(0, colon) : null;
 }
 
 /** null when the request carries the trial's token, else the 401 to answer. */
@@ -134,6 +142,65 @@ async function handleApi(forge: Forge, req: IncomingMessage, res: ServerResponse
   sendJson(res, reply.status, reply.body, { ...scopes, ...(reply.headers ?? {}) });
 }
 
+const GIT_ROUTE = /^\/([^/]+)\/([^/]+?)(?:\.git)?\/(info\/refs|git-upload-pack|git-receive-pack)$/;
+
+function sendGit(res: ServerResponse, reply: GitReply): void {
+  res.writeHead(reply.status, {
+    'content-type': reply.contentType,
+    'content-length': reply.body.length,
+    'cache-control': 'no-cache',
+    'x-github-request-id': requestId(),
+  });
+  res.end(reply.body);
+}
+
+/** /{owner}/{repo}.git/(info/refs|git-upload-pack|git-receive-pack): the smart-HTTP services. */
+async function handleGit(forge: Forge, req: IncomingMessage, res: ServerResponse, match: RegExpExecArray, url: URL): Promise<void> {
+  const denied = authFailure(req);
+  if (denied !== null) {
+    req.resume();
+    sendError(res, denied, { 'www-authenticate': 'Basic realm="forge"' });
+    return;
+  }
+  let owner: string;
+  let name: string;
+  try {
+    owner = decodeURIComponent(match[1] as string);
+    name = decodeURIComponent(match[2] as string);
+  } catch {
+    req.resume();
+    sendError(res, new ApiError(404, 'Not Found'));
+    return;
+  }
+  const action = match[3] as string;
+  const method = (req.method ?? 'GET').toUpperCase();
+  const gitProtocol = typeof req.headers['git-protocol'] === 'string' ? req.headers['git-protocol'] : '';
+  const repo = forge.findRepo(owner, name);
+  if (repo === null) {
+    req.resume();
+    sendError(res, new ApiError(404, 'Repository not found'));
+    return;
+  }
+  if (action === 'info/refs') {
+    req.resume();
+    const service = url.searchParams.get('service') ?? '';
+    if (method !== 'GET' || (service !== 'git-upload-pack' && service !== 'git-receive-pack')) {
+      sendError(res, new ApiError(403, 'smart HTTP requires ?service=git-upload-pack or git-receive-pack'));
+      return;
+    }
+    sendGit(res, infoRefs(forge, repo, service, gitProtocol));
+    return;
+  }
+  if (method !== 'POST') {
+    req.resume();
+    sendError(res, new ApiError(405, 'Method Not Allowed'));
+    return;
+  }
+  let body = await readBody(req);
+  if (/gzip/i.test(String(req.headers['content-encoding'] ?? ''))) body = gunzipSync(body);
+  sendGit(res, action === 'git-upload-pack' ? uploadPack(forge, repo, body, gitProtocol) : receivePack(forge, repo, body));
+}
+
 /** Build the server. It binds nothing until the caller listens; the entry listens on an ephemeral port. */
 export function createApp(): Server {
   const forge = new Forge();
@@ -157,6 +224,19 @@ export function createApp(): Server {
     if (path === API_PREFIX || path.startsWith(`${API_PREFIX}/`)) {
       handleApi(forge, req, res, url).catch((err: unknown) => {
         if (err instanceof ApiError) sendError(res, err, { 'x-oauth-scopes': OAUTH_SCOPES });
+        else {
+          process.stderr.write(`[entry] ${req.method} ${req.url}: ${err instanceof Error ? (err.stack ?? err.message) : String(err)}\n`);
+          sendJson(res, 500, { message: 'Internal Server Error' });
+        }
+      });
+      return;
+    }
+
+    const git = GIT_ROUTE.exec(path);
+    if (git !== null) {
+      handleGit(forge, req, res, git, url).catch((err: unknown) => {
+        if (err instanceof ApiError) sendError(res, err);
+        else if (err instanceof ProtocolError) sendJson(res, 400, { message: err.message });
         else {
           process.stderr.write(`[entry] ${req.method} ${req.url}: ${err instanceof Error ? (err.stack ?? err.message) : String(err)}\n`);
           sendJson(res, 500, { message: 'Internal Server Error' });

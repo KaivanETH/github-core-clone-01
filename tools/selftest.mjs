@@ -173,6 +173,106 @@ r = await call('POST', `${R('proj')}/pulls`, { body: { title: 'same', head: 'mai
 // determinism of shas: an identical repo built the same way yields the same commit sha only if clock matches; just check 40-hex.
 check('commit sha hex', SHA.test(mergeSha));
 
+// ---------------------------------------------------------------- git smart HTTP (the kit's own client)
+{
+  const kit = '/root/entries/kits/github-core-clone-01/github-core-clone-01-kit/program/env/src/git-client.ts';
+  const G = await import(kit);
+  const gc = new G.GitClient({ baseUrl: base, token: TOKEN, timeoutMs: 8000 });
+  const gc0 = new G.GitClient({ baseUrl: base, token: TOKEN, timeoutMs: 8000, gitProtocol: 0 });
+  const objs = new Map();
+  const put = (type, data) => { const oid = G.hashObject(type, data); objs.set(oid, { type, oid, data }); return oid; };
+  const mkCommit = (files, msg, parents = [], ts = 1700000000) => {
+    const tree = put('tree', G.buildTree(files.map(([name, text]) => ({ mode: '100644', name, oid: put('blob', Buffer.from(text)) }))));
+    return put('commit', G.buildCommit({ tree, parents, message: `${msg}\n`, timestamp: ts }));
+  };
+  const reach = (tips) => [...G.collectReachable ? G.collectReachable(tips, (o) => objs.get(o)) : []].map((o) => objs.get(o));
+  await call('POST', '/api/v3/user/repos', { body: { name: 'gitrepo', private: true } });
+  await call('GET', R('gitrepo'));
+  // empty repo: v2 advertisement, ls-refs, receive-pack advertisement, v0 headers
+  let raw = await gc.infoRefs(OWNER, 'gitrepo', 'git-upload-pack');
+  check('git v2 adv', raw.status === 200 && /x-git-upload-pack-advertisement/.test(raw.contentType) && raw.packets[0]?.payload?.toString() === 'version 2\n');
+  raw = await gc0.infoRefs(OWNER, 'gitrepo', 'git-upload-pack');
+  check('git v0 adv preamble', raw.status === 200 && raw.packets[0]?.payload?.toString() === '# service=git-upload-pack\n');
+  const adv = await gc.advertisement(OWNER, 'gitrepo', 'git-receive-pack');
+  check('git receive adv caps', adv.protocol === 0 && ['report-status', 'side-band-64k', 'delete-refs'].every((c) => adv.capabilities.has(c)));
+  let ls = await gc.lsRefs(OWNER, 'gitrepo', {});
+  check('git empty ls-refs', ls.refs.filter((r) => r.name.startsWith('refs/')).length === 0);
+  const empty = await gc.clone(OWNER, 'gitrepo');
+  check('git empty clone', empty.objects.size === 0);
+  raw = await gc.infoRefs(OWNER, 'nope-missing', 'git-upload-pack');
+  check('git missing 404', raw.status === 404 && /application\/json/.test(raw.contentType ?? ''));
+  raw = await gc.infoRefs(OWNER, 'nope-missing', 'git-receive-pack');
+  check('git missing 404 receive', raw.status === 404);
+  const anon = await fetch(`${base}/${OWNER}/gitrepo.git/info/refs?service=git-upload-pack`);
+  check('git unauth 401', anon.status === 401 && /application\/json/.test(anon.headers.get('content-type') ?? ''));
+  // first push + second push + tag
+  const c1 = mkCommit([['a.txt', 'one\n'], ['b.txt', 'bee\n']], 'first');
+  const all = (tips) => { const out = []; const seen = new Set(); const st = [...tips]; while (st.length) { const o = st.pop(); if (seen.has(o) || !objs.has(o)) continue; seen.add(o); const ob = objs.get(o); out.push(ob); if (ob.type === 'commit') { const c = G.parseCommit(ob.data); st.push(c.tree, ...c.parents); } else if (ob.type === 'tree') st.push(...G.parseTree(ob.data).map((e) => e.oid)); else if (ob.type === 'tag') st.push(G.parseTag(ob.data).object); } return out; };
+  let pr = await gc.push(OWNER, 'gitrepo', [{ oldOid: G.ZERO_OID, newOid: c1, ref: 'refs/heads/main' }], { objects: all([c1]) });
+  check('git push first', pr.sideband && pr.report?.unpackOk && pr.report.refs[0]?.ok, JSON.stringify(pr.report));
+  const c2 = mkCommit([['a.txt', 'one\ntwo\n'], ['b.txt', 'bee\n']], 'second', [c1], 1700000100);
+  const c3 = mkCommit([['a.txt', 'one\ntwo\nthree\n'], ['b.txt', 'bee\n']], 'third', [c2], 1700000200);
+  const tag = put('tag', G.buildTag({ object: c3, type: 'commit', tag: 'v1', message: 'v1\n' }));
+  pr = await gc.push(OWNER, 'gitrepo', [{ oldOid: c1, newOid: c3, ref: 'refs/heads/main' }, { oldOid: G.ZERO_OID, newOid: tag, ref: 'refs/tags/v1' }], { objects: all([tag]).filter((o) => o.oid !== c1) });
+  check('git push ff + tag', pr.report?.refs.every((r) => r.ok), JSON.stringify(pr.report));
+  ls = await gc.lsRefs(OWNER, 'gitrepo', { peel: true, symrefs: true });
+  check('git ls-refs', ls.refs.find((r) => r.name === 'HEAD')?.symrefTarget === 'refs/heads/main' && ls.refs.find((r) => r.name === 'refs/heads/main')?.oid === c3 && ls.refs.find((r) => r.name === 'refs/tags/v1')?.peeled === c3);
+  const pre = await gc.lsRefs(OWNER, 'gitrepo', { prefixes: ['refs/tags/'] });
+  check('git ls-refs prefix', pre.rawRefs.length === 1 && pre.rawRefs[0].name === 'refs/tags/v1');
+  // full clone verifies object for object
+  const cl = await gc.clone(OWNER, 'gitrepo');
+  const want = all([c3, tag]);
+  check('git clone objects', want.every((o) => cl.objects.get(o.oid)?.data.equals(o.data)) && cl.checksumOk, `got ${cl.objects.size} want ${want.length}`);
+  // shallow
+  const sh = await gc.clone(OWNER, 'gitrepo', { depth: 1 });
+  check('git shallow depth1', sh.objects.has(c3) && !sh.objects.has(c2) && sh.shallow.includes(c3));
+  const dp = await gc.fetch(OWNER, 'gitrepo', { wants: [c3], haves: [c3], shallow: sh.shallow, depth: 2, haveObjects: sh.objects });
+  check('git deepen 2', dp.objects.has(c2) && !dp.objects.has(c1) && (dp.shallow.includes(c2) || dp.unshallow.includes(c3)));
+  const inc = await gc.fetch(OWNER, 'gitrepo', { wants: [c3], haves: [c2] });
+  check('git incremental', inc.objects.has(c3) && !inc.objects.has(c2) && !inc.objects.has(c1));
+  const none = await gc.fetch(OWNER, 'gitrepo', { wants: [c3], haves: [c3] });
+  check('git nothing new', none.objects.size === 0);
+  // v0 fetch path
+  const v0 = await gc0.clone(OWNER, 'gitrepo');
+  check('git v0 clone', v0.objects.has(c3) && v0.objects.has(c1));
+  // non-fast-forward + mixed report
+  const sib = mkCommit([['a.txt', 'sibling\n']], 'sibling', [c1], 1700000300);
+  const c4 = mkCommit([['a.txt', 'four\n']], 'fourth', [c3], 1700000400);
+  pr = await gc.push(OWNER, 'gitrepo', [{ oldOid: G.ZERO_OID, newOid: c3, ref: 'refs/heads/side' }], { objects: [] });
+  check('git create branch', pr.report?.refs[0]?.ok);
+  pr = await gc.push(OWNER, 'gitrepo', [{ oldOid: c3, newOid: c4, ref: 'refs/heads/main' }, { oldOid: c3, newOid: sib, ref: 'refs/heads/side' }], { objects: [...all([c4]), ...all([sib])].filter((o) => ![c1, c2, c3].includes(o.oid)) });
+  const rm = pr.report?.refs.find((r) => r.ref === 'refs/heads/main'); const rs = pr.report?.refs.find((r) => r.ref === 'refs/heads/side');
+  check('git mixed report', rm?.ok === true && rs?.ok === false && /non-fast-forward/.test(rs?.reason ?? ''), JSON.stringify(pr.report));
+  ls = await gc.lsRefs(OWNER, 'gitrepo', {});
+  check('git ng unchanged', ls.refs.find((r) => r.name === 'refs/heads/side')?.oid === c3 && ls.refs.find((r) => r.name === 'refs/heads/main')?.oid === c4);
+  pr = await gc.push(OWNER, 'gitrepo', [{ oldOid: c3, newOid: G.ZERO_OID, ref: 'refs/heads/side' }, { oldOid: tag, newOid: G.ZERO_OID, ref: 'refs/tags/v1' }]);
+  ls = await gc.lsRefs(OWNER, 'gitrepo', {});
+  check('git delete refs', pr.report?.refs.every((r) => r.ok) && !ls.refs.some((r) => r.name === 'refs/heads/side' || r.name === 'refs/tags/v1'));
+  // REST sees pushed history
+  r = await call('GET', `${R('gitrepo')}/commits`);
+  check('git REST commits', r.status === 200 && r.json.map((c) => c.sha).join() === [c4, c3, c2, c1].join() && r.json[1].commit.message === 'third', JSON.stringify(r.json?.map?.((c) => c.sha)));
+  r = await call('GET', `${R('gitrepo')}/contents/a.txt`);
+  check('git REST contents', r.status === 200 && Buffer.from(r.json.content, 'base64').toString() === 'four\n');
+  r = await call('GET', `${R('gitrepo')}/contents/b.txt?ref=${c3}`);
+  check('git REST contents at sha', r.status === 200 && Buffer.from(r.json.content, 'base64').toString() === 'bee\n');
+  // REST commit then clone sees it
+  r = await call('PUT', `${R('gitrepo')}/contents/c.txt`, { body: { message: 'rest commit', content: b64('see\n') } });
+  const restSha = r.json.commit.sha;
+  const cl2 = await gc.clone(OWNER, 'gitrepo');
+  check('git clone sees REST commit', cl2.objects.has(restSha) && cl2.objects.has(c4));
+  // malformed body survives
+  const bad = await fetch(`${base}/${OWNER}/gitrepo.git/git-upload-pack`, { method: 'POST', headers: { authorization: `Bearer ${TOKEN}`, 'git-protocol': 'version=2', 'content-type': 'application/x-git-upload-pack-request' }, body: 'zzzznot-a-pkt-line' });
+  check('git malformed 400 json', bad.status === 400 && /application\/json/.test(bad.headers.get('content-type') ?? ''));
+  raw = await gc.infoRefs(OWNER, 'gitrepo', 'git-upload-pack');
+  check('git survives', raw.status === 200);
+  // sideband framing of a large pack (several pkt-lines)
+  const big = mkCommit([['big.bin', 'x'.repeat(200000) + Math.PI]], 'big', [restSha], 1700000500);
+  pr = await gc.push(OWNER, 'gitrepo', [{ oldOid: restSha, newOid: big, ref: 'refs/heads/main' }], { objects: all([big]).filter((o) => o.oid === big || !cl2.objects.has(o.oid)) });
+  check('git big push', pr.report?.refs[0]?.ok, JSON.stringify(pr.report));
+  const bigFetch = await gc.fetch(OWNER, 'gitrepo', { wants: [big], haves: [restSha] });
+  check('git big fetch', bigFetch.objects.has(big) && bigFetch.checksumOk);
+}
+
 done = true;
 const code = await Promise.race([exited, new Promise((r) => setTimeout(() => r('timeout'), 10000))]);
 check('entry exits 0 on done', code === 0, `code=${code}`);
