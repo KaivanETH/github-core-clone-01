@@ -273,6 +273,72 @@ check('commit sha hex', SHA.test(mergeSha));
   check('git big fetch', bigFetch.objects.has(big) && bigFetch.checksumOk);
 }
 
+// ---------------------------------------------------------------- GraphQL v4
+{
+  const gq = async (query, variables = {}, token = TOKEN) => {
+    const res = await fetch(`${base}/api/graphql`, { method: 'POST', headers: { 'content-type': 'application/json', ...(token ? { authorization: `Bearer ${token}` } : {}) }, body: JSON.stringify(Array.isArray(query) ? query : { query, variables }) });
+    check('gql json+rid', /application\/json/.test(res.headers.get('content-type') ?? '') && (res.headers.get('x-github-request-id') ?? '') !== '');
+    return { status: res.status, body: await res.json() };
+  };
+  let g = await gq('query { viewer { login } }', {}, null);
+  check('gql 401', g.status === 401 && typeof g.body.message === 'string');
+  g = await gq('query { viewer { login } }');
+  check('gql viewer', g.status === 200 && g.body.data.viewer.login === OWNER);
+  g = await gq('query { viewer { login noSuchFieldOnViewer } }');
+  check('gql unknown field', g.status === 200 && g.body.errors?.some((e) => e.message.includes('noSuchFieldOnViewer')));
+  g = await gq('query R($owner: String!, $name: String!) { repository(owner: $owner, name: $name) { id databaseId name nameWithOwner owner { login } defaultBranchRef { name } viewerPermission hasIssuesEnabled } }', { owner: OWNER, name: 'proj' });
+  const repoNode = g.body.data?.repository;
+  check('gql repository', repoNode?.name === 'proj' && repoNode.nameWithOwner === `${OWNER}/proj` && repoNode.defaultBranchRef?.name === 'main' && repoNode.hasIssuesEnabled === true && repoNode.viewerPermission === 'ADMIN' && !g.body.errors, JSON.stringify(g.body));
+  r = await call('GET', R('proj'));
+  check('gql id == REST node_id', repoNode?.id === r.json.node_id && repoNode.databaseId === r.json.id);
+  g = await gq('query { repository(owner: "x", name: "nope") { id } }');
+  check('gql unknown repo null', g.body.data?.repository === null && g.body.errors === undefined);
+  g = await gq('query { Issue: __type(name: "Issue") { fields(includeDeprecated: true) { name } } PullRequest: __type(name: "PullRequest") { fields { name } } Repository: __type(name: "Repository") { fields { name } } SearchType: __type(name: "SearchType") { enumValues(includeDeprecated: true) { name } } }');
+  const names = (k) => (g.body.data?.[k]?.fields ?? []).map((f) => f.name);
+  check('gql introspection', ['id', 'number', 'title', 'state', 'body'].every((n) => names('Issue').includes(n))
+    && ['id', 'number', 'headRefName', 'baseRefName', 'mergeable', 'state', 'merged', 'files'].every((n) => names('PullRequest').includes(n))
+    && ['id', 'databaseId', 'name', 'nameWithOwner', 'owner', 'defaultBranchRef', 'viewerPermission', 'hasIssuesEnabled', 'issue', 'issues', 'pullRequests', 'pullRequest'].every((n) => names('Repository').includes(n))
+    && g.body.data.SearchType.enumValues.some((e) => e.name === 'ISSUE'));
+  // issues ordering / states (proj has #1 open, #2 closed, PRs excluded)
+  for (const t of ['g1', 'g2']) await call('POST', `${R('proj')}/issues`, { body: { title: t, body: 'b' } });
+  g = await gq('query($o:String!,$n:String!){ repository(owner:$o,name:$n){ issues(first: 10, states: [OPEN], orderBy: {field: CREATED_AT, direction: DESC}) { nodes { number state id } } } }', { o: OWNER, n: 'proj' });
+  const nums = g.body.data.repository.issues.nodes.map((x) => x.number);
+  check('gql issues desc open', nums.length >= 3 && nums.every((n, i) => i === 0 || n < nums[i - 1]) && !nums.includes(2) && g.body.data.repository.issues.nodes.every((x) => x.state === 'OPEN'), JSON.stringify(nums));
+  g = await gq('query($o:String!,$n:String!,$a:String){ repository(owner:$o,name:$n){ issues(first: 2, after: $a) { nodes { number } pageInfo { hasNextPage endCursor } } } }', { o: OWNER, n: 'proj', a: null });
+  const p1 = g.body.data.repository.issues;
+  g = await gq('query($o:String!,$n:String!,$a:String){ repository(owner:$o,name:$n){ issues(first: 2, after: $a) { nodes { number } pageInfo { hasNextPage endCursor } } } }', { o: OWNER, n: 'proj', a: p1.pageInfo.endCursor });
+  check('gql cursor paging', p1.nodes.length === 2 && p1.pageInfo.hasNextPage === true && g.body.data.repository.issues.nodes.length === 2 && g.body.data.repository.issues.pageInfo.hasNextPage === false);
+  // mutations: createIssue, closeIssue, addComment, createPullRequest, mergePullRequest
+  g = await gq('mutation($input: CreateIssueInput!){ createIssue(input: $input) { issue { number id } } }', { input: { repositoryId: repoNode.id, title: 'via gql', body: 'gb' } });
+  const gi = g.body.data?.createIssue?.issue;
+  r = await call('GET', `${R('proj')}/issues/${gi?.number}`);
+  check('gql createIssue -> REST', r.status === 200 && r.json.title === 'via gql' && r.json.node_id === gi.id);
+  g = await gq('mutation($input: AddCommentInput!){ addComment(input: $input) { commentEdge { node { id body } } } }', { input: { subjectId: gi.id, body: 'gql comment' } });
+  r = await call('GET', `${R('proj')}/issues/${gi.number}/comments`);
+  check('gql addComment', g.body.data?.addComment?.commentEdge?.node?.body === 'gql comment' && r.json.some((c) => c.body === 'gql comment'));
+  g = await gq('mutation($input: CloseIssueInput!){ closeIssue(input: $input) { issue { number state } } }', { input: { issueId: gi.id } });
+  r = await call('GET', `${R('proj')}/issues/${gi.number}`);
+  check('gql closeIssue', g.body.data?.closeIssue?.issue?.state === 'CLOSED' && r.json.state === 'closed');
+  r = await call('GET', `${R('proj')}/commits?sha=main`);
+  await call('POST', `${R('proj')}/git/refs`, { body: { ref: 'refs/heads/gqlhead', sha: r.json[0].sha } });
+  await call('PUT', `${R('proj')}/contents/gql.txt`, { body: { message: 'gql head', content: b64('gql\n'), branch: 'gqlhead' } });
+  g = await gq('mutation($input: CreatePullRequestInput!){ createPullRequest(input: $input) { pullRequest { number id state headRefName baseRefName } } }', { input: { repositoryId: repoNode.id, baseRefName: 'main', headRefName: 'gqlhead', title: 'gql pr' } });
+  const gp = g.body.data?.createPullRequest?.pullRequest;
+  r = await call('GET', `${R('proj')}/pulls/${gp?.number}`);
+  check('gql createPullRequest -> REST', gp?.state === 'OPEN' && r.status === 200 && r.json.head.ref === 'gqlhead' && r.json.base.ref === 'main' && r.json.node_id === gp.id, JSON.stringify(g.body));
+  g = await gq('query($o:String!,$n:String!,$num:Int!){ repository(owner:$o,name:$n){ pullRequests(first: 5) { nodes { number headRefName baseRefName mergeable state } } pullRequest(number: $num) { files(first: 10) { nodes { path } } } } }', { o: OWNER, n: 'proj', num: gp.number });
+  check('gql pulls + files', g.body.data.repository.pullRequests.nodes.some((x) => x.number === gp.number && x.mergeable === 'MERGEABLE') && g.body.data.repository.pullRequest.files.nodes.some((f) => f.path === 'gql.txt'));
+  g = await gq('mutation($input: MergePullRequestInput!){ mergePullRequest(input: $input) { pullRequest { number merged state } } }', { input: { pullRequestId: gp.id, mergeMethod: 'SQUASH' } });
+  r = await call('GET', `${R('proj')}/pulls/${gp.number}`);
+  check('gql merge', g.body.data?.mergePullRequest?.pullRequest?.merged === true && g.body.data.mergePullRequest.pullRequest.state === 'MERGED' && r.json.merged === true && r.json.state === 'closed');
+  g = await gq('query($id: ID!){ node(id: $id) { id ... on Repository { name nameWithOwner } } }', { id: repoNode.id });
+  check('gql node', g.body.data?.node?.nameWithOwner === `${OWNER}/proj`);
+  g = await gq([{ query: 'query { viewer { login } }' }, { query: 'query { Issue: __type(name: "Issue") { fields { name } } }' }]);
+  check('gql batch', Array.isArray(g.body) && g.body.length === 2 && g.body[0].data.viewer.login === OWNER && g.body[1].data.Issue.fields.length > 0);
+  const bad = await fetch(`${base}/api/graphql`, { method: 'POST', headers: { authorization: `Bearer ${TOKEN}`, 'content-type': 'application/json' }, body: '{"query":' });
+  check('gql bad json 400', bad.status === 400);
+}
+
 done = true;
 const code = await Promise.race([exited, new Promise((r) => setTimeout(() => r('timeout'), 10000))]);
 check('entry exits 0 on done', code === 0, `code=${code}`);

@@ -11,6 +11,7 @@ import { ApiError, Forge } from './forge.ts';
 import { handleRest, type Ctx, type Reply } from './rest.ts';
 import { infoRefs, ProtocolError, receivePack, uploadPack, type GitReply } from './gitproto.ts';
 import { gunzipSync } from 'node:zlib';
+import { handleGraphQL } from './graphql.ts';
 
 const JSON_TYPE = 'application/json; charset=utf-8';
 const API_PREFIX = '/api/v3';
@@ -201,6 +202,31 @@ async function handleGit(forge: Forge, req: IncomingMessage, res: ServerResponse
   sendGit(res, action === 'git-upload-pack' ? uploadPack(forge, repo, body, gitProtocol) : receivePack(forge, repo, body));
 }
 
+/** POST /api/graphql: {query, variables, operationName} or an array of them; 401 without the token. */
+async function handleGraphQLRequest(forge: Forge, req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const scopes = { 'x-oauth-scopes': OAUTH_SCOPES };
+  const denied = authFailure(req);
+  if (denied !== null) {
+    req.resume();
+    sendError(res, denied);
+    return;
+  }
+  if ((req.method ?? 'GET').toUpperCase() !== 'POST') {
+    req.resume();
+    sendError(res, new ApiError(404, 'Not Found'), scopes);
+    return;
+  }
+  const text = (await readBody(req)).toString('utf8');
+  let body: unknown;
+  try {
+    body = JSON.parse(text);
+  } catch {
+    sendError(res, new ApiError(400, 'Problems parsing JSON'), scopes);
+    return;
+  }
+  sendJson(res, 200, handleGraphQL(forge, originOf(req), body), scopes);
+}
+
 /** Build the server. It binds nothing until the caller listens; the entry listens on an ephemeral port. */
 export function createApp(): Server {
   const forge = new Forge();
@@ -224,6 +250,17 @@ export function createApp(): Server {
     if (path === API_PREFIX || path.startsWith(`${API_PREFIX}/`)) {
       handleApi(forge, req, res, url).catch((err: unknown) => {
         if (err instanceof ApiError) sendError(res, err, { 'x-oauth-scopes': OAUTH_SCOPES });
+        else {
+          process.stderr.write(`[entry] ${req.method} ${req.url}: ${err instanceof Error ? (err.stack ?? err.message) : String(err)}\n`);
+          sendJson(res, 500, { message: 'Internal Server Error' });
+        }
+      });
+      return;
+    }
+
+    if (path === '/api/graphql' || path === '/api/graphql/') {
+      handleGraphQLRequest(forge, req, res).catch((err: unknown) => {
+        if (err instanceof ApiError) sendError(res, err);
         else {
           process.stderr.write(`[entry] ${req.method} ${req.url}: ${err instanceof Error ? (err.stack ?? err.message) : String(err)}\n`);
           sendJson(res, 500, { message: 'Internal Server Error' });

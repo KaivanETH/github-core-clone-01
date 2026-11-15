@@ -316,7 +316,7 @@ function contentRoutes(forge: Forge, repo: Repo, ctx: Ctx, rawPath: string): Rep
     return {
       status: result.created ? 201 : 200,
       body: {
-        content: contentEntryJson(forge, repo, result.path, 'file', result.blobSha, blob.length, base, ref),
+        content: { ...contentEntryJson(forge, repo, result.path, 'file', result.blobSha, blob.length, base, ref), encoding: 'base64' },
         commit: gitCommitJson(forge, repo, result.commit, base),
       },
     };
