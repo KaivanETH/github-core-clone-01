@@ -118,8 +118,16 @@ function startTime(): number {
   return DEFAULT_EPOCH;
 }
 
+const isoCache = new Map<number, string>();
+
 export function isoTime(seconds: number): string {
-  return new Date(seconds * 1000).toISOString().replace(/\.\d{3}Z$/, 'Z');
+  let text = isoCache.get(seconds);
+  if (text === undefined) {
+    text = new Date(seconds * 1000).toISOString().replace(/\.\d{3}Z$/, 'Z');
+    if (isoCache.size > 100_000) isoCache.clear();
+    isoCache.set(seconds, text);
+  }
+  return text;
 }
 
 export class Forge {

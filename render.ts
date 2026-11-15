@@ -11,9 +11,16 @@ export function nodeId(kind: string, id: number | string): string {
   return `${kind}_${Buffer.from(`${kind}:${id}`, 'utf8').toString('base64url')}`;
 }
 
+let userCacheKey = '';
+let userCache: Json = {};
+
+/** The viewer's user object; one shared, never-mutated object per (login, base). */
 export function userJson(forge: Forge, base: string): Json {
   const login = forge.login;
-  return {
+  const key = `${login}\n${forge.viewerId}\n${base}`;
+  if (key === userCacheKey) return userCache;
+  userCacheKey = key;
+  userCache = {
     login,
     id: forge.viewerId,
     node_id: nodeId('U', forge.viewerId),
@@ -25,6 +32,7 @@ export function userJson(forge: Forge, base: string): Json {
     type: 'User',
     site_admin: false,
   };
+  return userCache;
 }
 
 export function repoJson(forge: Forge, repo: Repo, base: string): Json {

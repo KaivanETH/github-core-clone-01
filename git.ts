@@ -186,8 +186,8 @@ export class GitStore {
     const seen = new Set<string>();
     const out: Commit[] = [];
     const stack = [...tips];
-    while (stack.length > 0) {
-      const sha = stack.shift() as string;
+    for (let head = 0; head < stack.length; head += 1) {
+      const sha = stack[head] as string;
       if (seen.has(sha)) continue;
       seen.add(sha);
       const commit = this.commit(sha);
@@ -229,8 +229,8 @@ export class GitStore {
     }
     const queue = [b];
     const seen = new Set<string>();
-    while (queue.length > 0) {
-      const sha = queue.shift() as string;
+    for (let head = 0; head < queue.length; head += 1) {
+      const sha = queue[head] as string;
       if (ancestors.has(sha)) return sha;
       if (seen.has(sha)) continue;
       seen.add(sha);

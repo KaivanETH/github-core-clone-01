@@ -26,22 +26,20 @@ function requestId(): string {
   return `F0C5:${requestCounter.toString(16).toUpperCase().padStart(8, '0')}`;
 }
 
-/** Answer one request with a JSON body; `headers` go beside the JSON ones. */
+/** Answer one request with a JSON body; `headers` go beside the JSON ones (same names, same order as before). */
 function sendJson(res: ServerResponse, status: number, body: unknown, headers: Readonly<Record<string, string>> = {}): void {
   if (res.headersSent) return;
-  const base: Record<string, string | number> = {
+  const text = status === 204 || body === undefined ? '' : JSON.stringify(body);
+  const out: Record<string, string | number> = {
     'content-type': JSON_TYPE,
     'x-github-request-id': requestId(),
     'x-github-media-type': 'github.v3; format=json',
+    'content-length': text === '' ? 0 : Buffer.byteLength(text),
   };
-  if (status === 204 || body === undefined) {
-    res.writeHead(status, { ...base, 'content-length': 0, ...headers });
-    res.end();
-    return;
-  }
-  const text = JSON.stringify(body);
-  res.writeHead(status, { ...base, 'content-length': Buffer.byteLength(text), ...headers });
-  res.end(text);
+  for (const name in headers) out[name] = headers[name] as string;
+  res.writeHead(status, out);
+  if (text === '') res.end();
+  else res.end(text);
 }
 
 function sendError(res: ServerResponse, error: ApiError, headers: Readonly<Record<string, string>> = {}): void {
@@ -63,11 +61,16 @@ function credentialOf(req: IncomingMessage): string | null {
 }
 
 /** null when the request carries the trial's token, else the 401 to answer. */
+let lastGoodAuthorization: string | null = null;
+
 function authFailure(req: IncomingMessage): ApiError | null {
+  const header = req.headers.authorization;
+  if (header !== undefined && header === lastGoodAuthorization) return null;
   const presented = credentialOf(req);
   if (presented === null) return new ApiError(401, 'Requires authentication');
   const expected = process.env.MAKEFUN_SHOP_TOKEN ?? '';
   if (expected !== '' && presented !== expected) return new ApiError(401, 'Bad credentials');
+  if (typeof header === 'string') lastGoodAuthorization = header;
   return null;
 }
 
@@ -91,6 +94,7 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
 
 /** The decoded path segments of `path`, or null when one does not decode. */
 function segmentsOf(path: string): string[] | null {
+  if (!path.includes('%')) return path.split('/').filter((part) => part !== '');
   const out: string[] = [];
   for (const raw of path.split('/')) {
     if (raw === '') continue;
@@ -110,7 +114,7 @@ function originOf(req: IncomingMessage): string {
   return `http://${address.includes(':') ? `[${address}]` : address}:${req.socket.localPort ?? 80}`;
 }
 
-async function handleApi(forge: Forge, req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
+async function handleApi(forge: Forge, req: IncomingMessage, res: ServerResponse, url: ReqUrl): Promise<void> {
   const scopes = { 'x-oauth-scopes': OAUTH_SCOPES, 'x-accepted-oauth-scopes': '' };
   const denied = authFailure(req);
   if (denied !== null) {
@@ -157,7 +161,7 @@ function sendGit(res: ServerResponse, reply: GitReply): void {
 }
 
 /** /{owner}/{repo}.git/(info/refs|git-upload-pack|git-receive-pack): the smart-HTTP services. */
-async function handleGit(forge: Forge, req: IncomingMessage, res: ServerResponse, match: RegExpExecArray, url: URL): Promise<void> {
+async function handleGit(forge: Forge, req: IncomingMessage, res: ServerResponse, match: RegExpExecArray, url: ReqUrl): Promise<void> {
   const denied = authFailure(req);
   if (denied !== null) {
     req.resume();
@@ -252,16 +256,33 @@ async function handleGraphQLRequest(forge: Forge, req: IncomingMessage, res: Ser
   sendJson(res, 200, handleGraphQL(forge, originOf(req), body), scopes);
 }
 
+/** The parts of a request target the routes read. */
+interface ReqUrl {
+  pathname: string;
+  searchParams: URLSearchParams;
+}
+
+const PLAIN_TARGET = /^\/[A-Za-z0-9\-._~%!$&'()*+,;=:@/?]*$/;
+
+/** A plain origin-form target is split by hand; anything unusual goes through WHATWG URL as before. */
+function parseUrl(target: string): ReqUrl {
+  const query = target.indexOf('?');
+  const pathname = query < 0 ? target : target.slice(0, query);
+  if (PLAIN_TARGET.test(target) && !pathname.includes('/.') && !pathname.includes('//')) {
+    return { pathname, searchParams: new URLSearchParams(query < 0 ? '' : target.slice(query + 1)) };
+  }
+  try {
+    return new URL(target, 'http://entry');
+  } catch {
+    return new URL('http://entry/');
+  }
+}
+
 /** Build the server. It binds nothing until the caller listens; the entry listens on an ephemeral port. */
 export function createApp(): Server {
   const forge = new Forge();
   const server = createServer((req: IncomingMessage, res: ServerResponse) => {
-    let url: URL;
-    try {
-      url = new URL(req.url ?? '/', 'http://entry');
-    } catch {
-      url = new URL('http://entry/');
-    }
+    const url = parseUrl(req.url ?? '/');
     const path = url.pathname;
     const method = req.method ?? 'GET';
 
