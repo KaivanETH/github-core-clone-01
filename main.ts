@@ -29,6 +29,8 @@ const REQUEST_TIMEOUT_MS = 30_000;
 /** The first wait between retries, and the longest. */
 const RETRY_INITIAL_MS = 250;
 const RETRY_MAX_MS = 2_000;
+// Bounds register(): an env that never accepts the port should end the process with a reason, not hang it.
+const REGISTER_MAX_ATTEMPTS = 120;
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -43,6 +45,8 @@ function retryDelay(attempt: number): number {
  * a network error or another status is retried, since the env may still be starting.
  */
 async function register(port: number): Promise<void> {
+  // Start time, so the give-up error can say how long registration was tried for.
+  const startedAt = Date.now();
   for (let attempt = 0; ; attempt += 1) {
     try {
       const res = await fetch(`${ENV_URL}/register`, {
@@ -55,6 +59,10 @@ async function register(port: number): Promise<void> {
       if (res.status === 400 || res.status === 405) throw new Error(`register answered HTTP ${res.status}: ${await res.text()}`);
     } catch (err) {
       if (err instanceof Error && err.message.startsWith('register answered HTTP ')) throw err;
+    }
+    // Stop after REGISTER_MAX_ATTEMPTS failed tries instead of retrying forever; main() turns this into exit 1.
+    if (attempt + 1 >= REGISTER_MAX_ATTEMPTS) {
+      throw new Error(`register gave up after ${REGISTER_MAX_ATTEMPTS} attempts over ${((Date.now() - startedAt) / 1000).toFixed(1)}s`);
     }
     await sleep(retryDelay(attempt));
   }
@@ -76,9 +84,31 @@ async function waitForDone(): Promise<void> {
   }
 }
 
+// The server main() bound, kept here so a signal handler can close it; null until main() creates it.
+let activeServer: ReturnType<typeof createApp> | null = null;
+// Set by the first signal so a second SIGINT/SIGTERM does not start a second shutdown.
+let shuttingDown = false;
+
+// One shutdown path for SIGINT and SIGTERM: close the server (dropping keep-alive sockets so close cannot hang), then exit 0.
+function onShutdown(signal: string): void {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  process.stderr.write(`[entry] ${signal} received; closing the server\n`);
+  const server = activeServer;
+  if (server === null) process.exit(0);
+  server.close(() => process.exit(0));
+  server.closeAllConnections();
+}
+
+// Ctrl-C locally and the harness's stop both end the process cleanly through onShutdown.
+process.on('SIGINT', () => onShutdown('SIGINT'));
+process.on('SIGTERM', () => onShutdown('SIGTERM'));
+
 /** Bound the port, register it, then wait for the env: the whole life of the process. */
 async function main(): Promise<void> {
   const server = createApp();
+  // Expose the server to onShutdown as soon as it exists.
+  activeServer = server;
   await new Promise<void>((resolve, reject) => {
     server.once('error', reject);
     server.listen(0, () => resolve());
