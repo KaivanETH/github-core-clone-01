@@ -126,13 +126,17 @@ async function handleApi(forge: Forge, req: IncomingMessage, res: ServerResponse
   let body: unknown;
   if (method !== 'GET' && method !== 'HEAD') {
     const raw = await readBody(req);
-    const text = raw.toString('utf8');
-    if (text.trim() !== '') {
+    if (raw.length > 0) {
+      const text = raw.toString('utf8');
       try {
         body = JSON.parse(text);
       } catch {
-        sendError(res, new ApiError(400, 'Problems parsing JSON'), scopes);
-        return;
+        // JSON.parse rejects whitespace-only bodies; those still mean "no body", as before.
+        if (text.trim() === '') body = undefined;
+        else {
+          sendError(res, new ApiError(400, 'Problems parsing JSON'), scopes);
+          return;
+        }
       }
     }
   } else {
@@ -145,7 +149,8 @@ async function handleApi(forge: Forge, req: IncomingMessage, res: ServerResponse
   }
   const ctx: Ctx = { method, segs, query: url.searchParams, body, base: originOf(req), path: url.pathname };
   const reply: Reply = handleRest(forge, ctx);
-  sendJson(res, reply.status, reply.body, { ...scopes, ...(reply.headers ?? {}) });
+  const extraHeaders = reply.headers;
+  sendJson(res, reply.status, reply.body, extraHeaders === undefined ? scopes : { ...scopes, ...extraHeaders });
 }
 
 const GIT_ROUTE = /^\/([^/]+)\/([^/]+?)(?:\.git)?\/(info\/refs|git-upload-pack|git-receive-pack)$/;

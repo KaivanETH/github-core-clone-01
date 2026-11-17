@@ -433,6 +433,24 @@ function packSection(forge: Forge, plan: FetchPlan): Buffer[] {
   return sideband(1, writePack(forge.git, plan.objects));
 }
 
+// PERF: memo of fetch replies. A fetch reply is a pure function of the request bytes (the want
+// lines) and the object store, which only grows during a trial; an identical fetch body therefore
+// answers byte for byte. ls-refs answers from the repo's refs and is never memoised.
+const FETCH_MEMO_MAX = 64;
+const fetchMemo = new Map<string, Buffer>();
+function memoFetch(body: Buffer, build: () => Buffer): Buffer {
+  const key = createHash('sha1').update(body).digest('hex');
+  const hit = fetchMemo.get(key);
+  if (hit !== undefined) return hit;
+  const reply = build();
+  if (fetchMemo.size >= FETCH_MEMO_MAX) {
+    const oldest = fetchMemo.keys().next();
+    if (oldest.done !== true) fetchMemo.delete(oldest.value);
+  }
+  fetchMemo.set(key, reply);
+  return reply;
+}
+
 export function uploadPack(forge: Forge, repo: Repo, body: Buffer, gitProtocol: string): GitReply {
   void repo;
   const result = 'application/x-git-upload-pack-result';
@@ -451,11 +469,11 @@ export function uploadPack(forge: Forge, repo: Repo, body: Buffer, gitProtocol: 
       for (i += 1; i < packets.length && packets[i]?.kind === 'data'; i += 1) args.push(lineOf(packets[i] as Packet));
     }
     if (command === 'ls-refs') return { status: 200, contentType: result, body: lsRefs(forge, repo, args) };
-    if (command === 'fetch') return { status: 200, contentType: result, body: fetchV2(forge, args) };
+    if (command === 'fetch') return { status: 200, contentType: result, body: memoFetch(body, () => fetchV2(forge, args)) };
     if (command === '') return { status: 200, contentType: result, body: FLUSH };
     throw new ProtocolError(`unknown command ${command}`);
   }
-  return { status: 200, contentType: result, body: fetchV0(forge, body) };
+  return { status: 200, contentType: result, body: memoFetch(body, () => fetchV0(forge, body)) };
 }
 
 function lsRefs(forge: Forge, repo: Repo, args: readonly string[]): Buffer {
